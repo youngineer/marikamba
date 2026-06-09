@@ -1,0 +1,249 @@
+// ============================================================
+// Prisma Schema — School Marks & Attendance Management System
+// Database: PostgreSQL (Supabase)
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum Role {
+  ADMIN
+  TEACHER
+  PARENT
+}
+
+enum ExamCategory {
+  FA      // FA1, FA2, FA3, FA4 — 20 marks each
+  SA      // SA1 — 80 + FA contribution
+  PREP    // Preparatory 1, 2, 3 — standalone
+  ANNUAL  // Final — 80 + FA contribution
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+}
+
+enum AuditAction {
+  ACADEMIC_YEAR_RESET
+  PASSWORD_RESET
+  MARKS_UPLOAD
+  MARKS_DELETE
+  ATTENDANCE_MARK
+}
+
+// ============================================================
+// USERS — single table for all roles
+// ============================================================
+
+model User {
+  id            String   @id @default(uuid())
+  name          String
+  role          Role
+  loginId       String   @unique // roll number for parents, custom for teachers/admin
+  passwordHash  String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  teacher       Teacher?
+  parent        Parent?
+  attendanceMarked Attendance[] @relation("MarkedBy")
+  auditLogs     AuditLog[]
+
+  @@map("users")
+}
+
+// ============================================================
+// STUDENTS
+// ============================================================
+
+model Student {
+  id          String   @id @default(uuid())
+  rollNumber  String   @unique
+  name        String
+  photoUrl    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  parent      Parent?
+  marks       Mark[]
+  attendance  Attendance[]
+
+  @@map("students")
+}
+
+// ============================================================
+// TEACHERS — role-specific data
+// ============================================================
+
+model Teacher {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  subjectId       String   @unique // strict 1-to-1: one teacher per subject
+  isClassTeacher  Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject         Subject  @relation(fields: [subjectId], references: [id])
+
+  @@map("teachers")
+}
+
+// ============================================================
+// PARENTS — role-specific data
+// ============================================================
+
+model Parent {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  studentId String   @unique // one parent account per student
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@map("parents")
+}
+
+// ============================================================
+// SUBJECTS — 6 total, including Kannada
+// ============================================================
+
+model Subject {
+  id          String   @id @default(uuid())
+  name        String   // English name
+  nameKannada String   // Kannada name
+  isKannada   Boolean  @default(false) // flags special conversion logic
+  order       Int      @unique // display order in reports (1-6)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  teacher     Teacher?
+  marks       Mark[]
+
+  @@map("subjects")
+}
+
+// ============================================================
+// EXAM TYPES — defined by admin, 9 total
+// ============================================================
+
+model ExamType {
+  id                String       @id @default(uuid())
+  name              String       // e.g. "FA1", "SA1", "Preparatory 1"
+  nameKannada       String       // Kannada name
+  category          ExamCategory
+  sequence          Int          // position within category (1,2,3,4)
+  maxWrittenMarks   Int          // marks teacher enters (20 for FA, 80 for others, 100 for Kannada in SA/PREP/ANNUAL)
+  maxInternalMarks  Int?         // FA contribution (nullable for standalone exams)
+  maxTotalMarks     Int          // final max after accumulation
+  isStandalone      Boolean      @default(true) // false for SA1 and ANNUAL
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  // Relations
+  marks             Mark[]
+
+  @@unique([category, sequence]) // no duplicate FA1, FA2 etc
+  @@map("exam_types")
+}
+
+// ============================================================
+// MARKS — raw marks entered by teachers
+// Computed values (converted Kannada marks, SA1/Final totals,
+// grades) are calculated at query time, never stored
+// ============================================================
+
+model Mark {
+  id            String   @id @default(uuid())
+  studentId     String
+  subjectId     String
+  examTypeId    String
+  marksObtained Decimal  @db.Decimal(5, 2) // raw marks as entered by teacher
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  student       Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subject       Subject  @relation(fields: [subjectId], references: [id])
+  examType      ExamType @relation(fields: [examTypeId], references: [id])
+
+  // One mark per student per subject per exam — upsert pattern
+  @@unique([studentId, subjectId, examTypeId])
+  @@map("marks")
+}
+
+// ============================================================
+// ATTENDANCE — one record per student per day
+// marked by class teacher or admin only
+// ============================================================
+
+model Attendance {
+  id        String           @id @default(uuid())
+  studentId String
+  date      DateTime         @db.Date
+  status    AttendanceStatus
+  markedBy  String           // FK to users (class teacher or admin)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  // Relations
+  student   Student          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  marker    User             @relation("MarkedBy", fields: [markedBy], references: [id])
+
+  // One attendance record per student per day
+  @@unique([studentId, date])
+  @@map("attendance")
+}
+
+// ============================================================
+// GRADING SCALE — configured by admin
+// percentage-based, applies to all exam types
+// ============================================================
+
+model GradingScale {
+  id             String   @id @default(uuid())
+  minPercentage  Decimal  @db.Decimal(5, 2)
+  maxPercentage  Decimal  @db.Decimal(5, 2)
+  grade          String   // "A1", "A2", "B1" etc
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("grading_scale")
+}
+
+// ============================================================
+// AUDIT LOG — never wiped, tracks critical admin actions
+// ============================================================
+
+model AuditLog {
+  id        String      @id @default(uuid())
+  userId    String      // who performed the action
+  action    AuditAction
+  metadata  Json?       // additional context (e.g. which teacher's password was reset)
+  createdAt DateTime    @default(now())
+
+  // Relations
+  user      User        @relation(fields: [userId], references: [id])
+
+  @@map("audit_logs")
+}
